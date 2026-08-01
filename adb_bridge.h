@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <utility>
@@ -53,6 +54,14 @@ public:
     void set_serial(const std::string& serial) { serial_ = serial; resolved_transport_.reset(); }
 
 private:
+    // Тип дескриптора сокета. Намеренно НЕ SOCKET и НЕ <winsock2.h>:
+    // этот заголовок подключают main.cpp / phone_info.cpp / sdk_builder.cpp,
+    // которые тянут <windows.h>, а windows.h раньше winsock2.h даёт конфликт
+    // объявлений winsock.h. На MSVC SOCKET == UINT_PTR == std::uintptr_t,
+    // поэтому определение в .cpp можно писать через привычный SOCKET —
+    // сигнатуры совпадут.
+    using socket_t = std::uintptr_t;
+
     std::string adb_path_;
     std::string serial_;
     int server_port_ = 5037;
@@ -76,7 +85,7 @@ private:
     std::optional<std::string> resolve_transport_service(std::string& err_out) const;
 
     // Переключает уже открытый сокет на устройство.
-    bool open_transport(SOCKET s, std::string& err_out) const;
+    bool open_transport(socket_t s, std::string& err_out) const;
 
     // shell v2: возвращает exit_code == -2 как сигнал "handshake не удался,
     // нужно откатиться на v1" (см. shell() в .cpp)
