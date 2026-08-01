@@ -14,10 +14,25 @@
 
 namespace adbproto {
 
+// ── Лимиты и таймауты ──
+// adb оперирует буфером MAX_PAYLOAD = 1 МБ, поэтому любой пакет больше этого
+// считаем протокольным сбоем, а не поводом выделять память по запросу
+// удалённой стороны.
+constexpr uint32_t kMaxShellPayload = 1u * 1024u * 1024u;
+
+// Значения по умолчанию для SO_RCVTIMEO / SO_SNDTIMEO, мс.
+constexpr int kDefaultRecvTimeoutMs = 30000;
+constexpr int kDefaultSendTimeoutMs = 30000;
+
 // ── Сокеты ──
 SOCKET connect_localhost(int port);
 bool send_all(SOCKET s, const char* data, size_t len);
 bool recv_exact(SOCKET s, char* buf, size_t len);
+
+// Выставляет таймауты на приём/отправку. 0 = блокироваться бесконечно.
+// connect_localhost вызывает это сам со значениями по умолчанию; отдельный
+// вызов нужен для долгих операций (push/pull больших файлов).
+bool set_socket_timeouts(SOCKET s, int recv_ms, int send_ms);
 
 // ── Smart-socket текстовый протокол (host <-> adb server) ──
 // Запрос: 4 hex-символа длины (lowercase) + ASCII-строка сервиса.
@@ -47,7 +62,7 @@ struct ShellPacket {
     std::string data;
 };
 
-// Читает один пакет. false = соединение закрыто/ошибка.
+// Читает один пакет. false = соединение закрыто/ошибка/длина вне лимита.
 bool read_shell_packet(SOCKET s, ShellPacket& out);
 
 } // namespace adbproto
