@@ -4,13 +4,15 @@
 #include <filesystem>
 #include <chrono>
 #include <iomanip>
+#include <cctype>
+#include <cstdio>
 #include <windows.h>
 
 namespace fs = std::filesystem;
 
-// ─────────────────────────────────────────────
+// ───────────────────────────────────────────
 // Минимальный JSON writer/reader (без зависимостей)
-// ─────────────────────────────────────────────
+// ───────────────────────────────────────────
 
 static std::string json_escape(const std::string& s) {
     std::string out;
@@ -20,7 +22,16 @@ static std::string json_escape(const std::string& s) {
         else if (c == '\n') out += "\\n";
         else if (c == '\r') out += "\\r";
         else if (c == '\t') out += "\\t";
-        else                out += c;
+        else if (c == '\b') out += "\\b";
+        else if (c == '\f') out += "\\f";
+        else if (static_cast<unsigned char>(c) < 0x20) {
+            // Вывод устройства (dumpsys/getprop) регулярно содержит управляющие
+            // символы. Раньше они попадали в файл как есть и делали JSON невалидным.
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+            out += buf;
+        }
+        else out += c;
     }
     return out;
 }
@@ -35,7 +46,20 @@ static std::string json_unescape(const std::string& s) {
             else if (s[i] == 'n')  out += '\n';
             else if (s[i] == 'r')  out += '\r';
             else if (s[i] == 't')  out += '\t';
-            else                   out += s[i];
+            else if (s[i] == 'b')  out += '\b';
+            else if (s[i] == 'f')  out += '\f';
+            else if (s[i] == 'u' && i + 4 < s.size()) {
+                // Поддерживаем только то, что сами записываем: \u00XX.
+                const std::string hex = s.substr(i + 1, 4);
+                try {
+                    const int code = std::stoi(hex, nullptr, 16);
+                    if (code >= 0 && code < 0x80) out += static_cast<char>(code);
+                    i += 4;
+                } catch (...) {
+                    out += 'u';
+                }
+            }
+            else out += s[i];
         } else {
             out += s[i];
         }
@@ -56,7 +80,7 @@ static std::string json_get(const std::string& json, const std::string& key) {
     ++pos;
     while (pos < json.size() && std::isspace((unsigned char)json[pos])) ++pos;
 
-    if (json[pos] == '"') {
+    if (pos < json.size() && json[pos] == '"') {
         ++pos;
         std::string val;
         while (pos < json.size() && json[pos] != '"') {
@@ -72,6 +96,29 @@ static std::string json_get(const std::string& json, const std::string& key) {
     return "";
 }
 
+// Найти индекс '}', закрывающей объект, открытый на позиции open.
+// Раньше бралась первая встречная '}', и любой вложенный объект
+// (или '}' внутри строкового значения) обрезал запись посередине.
+static size_t find_object_end(const std::string& s, size_t open) {
+    int depth = 0;
+    bool in_string = false;
+    for (size_t i = open; i < s.size(); ++i) {
+        const char c = s[i];
+        if (in_string) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') { in_string = true; continue; }
+        if (c == '{') ++depth;
+        else if (c == '}') {
+            --depth;
+            if (depth == 0) return i;
+        }
+    }
+    return std::string::npos;
+}
+
 static std::string now_iso() {
     auto now = std::chrono::system_clock::now();
     auto t   = std::chrono::system_clock::to_time_t(now);
@@ -82,9 +129,9 @@ static std::string now_iso() {
     return ss.str();
 }
 
-// ─────────────────────────────────────────────
+// ───────────────────────────────────────────
 // SdkCache
-// ─────────────────────────────────────────────
+// ───────────────────────────────────────────
 
 static std::string get_exe_dir_cache() {
     char buf[MAX_PATH];
@@ -106,11 +153,24 @@ std::string SdkCache::get_default_cache_dir() {
 }
 
 std::string SdkCache::cache_path(const std::string& serial) const {
-    // Sanitize serial для имени файла
-    std::string safe = serial;
-    for (char& c : safe) {
-        if (c == ':' || c == '/' || c == '\\') c = '_';
+    // Sanitize serial для имени файла.
+    //
+    // Раньше заменялись только ':', '/' и '\\'. Серийный номер приходит с
+    // устройства, т.е. контролируется тем, кто его подключает; значение ".."
+    // выводило запись и invalidate()-удаление за пределы кэш-директории.
+    // Теперь whitelist вместо точечных замен.
+    std::string safe;
+    safe.reserve(serial.size());
+    for (char c : serial) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (std::isalnum(u) || c == '.' || c == '_' || c == '-') safe += c;
+        else safe += '_';
     }
+
+    // "." и ".." состоят только из разрешённых символов — отсекаем отдельно.
+    if (safe.empty() || safe == "." || safe == "..") safe = "unknown_device";
+    if (safe.size() > 128) safe.resize(128);
+
     return cache_dir_ + "\\" + safe + ".json";
 }
 
@@ -146,7 +206,11 @@ bool SdkCache::save(const DeviceSdk& sdk) const {
     }
 
     f << "\n  }\n}\n";
-    return true;
+    f.flush();
+
+    // Раньше всегда возвращался true — переполненный диск или потеря доступа
+    // к файлу тихо давали "успешно сохранённый" пустой/обрезанный кэш.
+    return static_cast<bool>(f);
 }
 
 std::optional<DeviceSdk> SdkCache::load(const std::string& serial) const {
@@ -156,36 +220,50 @@ std::optional<DeviceSdk> SdkCache::load(const std::string& serial) const {
     std::string content((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
 
+    auto cmd_start = content.find("\"commands\"");
+
+    // Метаданные читаем только из шапки файла. Раньше json_get шёл по всему
+    // документу, и запись команды с ключом вроде "build_id" могла подменить
+    // метаданные устройства и сломать is_valid() — кэш переставал бы
+    // инвалидироваться после обновления прошивки.
+    const std::string header = (cmd_start == std::string::npos)
+        ? content
+        : content.substr(0, cmd_start);
+
     DeviceSdk sdk;
-    sdk.serial          = json_get(content, "serial");
-    sdk.android_version = json_get(content, "android_version");
-    sdk.build_id        = json_get(content, "build_id");
-    sdk.sdk_version     = json_get(content, "sdk_version");
-    sdk.generated_at    = json_get(content, "generated_at");
+    sdk.serial          = json_get(header, "serial");
+    sdk.android_version = json_get(header, "android_version");
+    sdk.build_id        = json_get(header, "build_id");
+    sdk.sdk_version     = json_get(header, "sdk_version");
+    sdk.generated_at    = json_get(header, "generated_at");
 
     // Парсим commands: ищем все ключи внутри "commands": { ... }
-    auto cmd_start = content.find("\"commands\"");
     if (cmd_start == std::string::npos) return sdk;
 
     auto block_start = content.find('{', cmd_start + 10);
     if (block_start == std::string::npos) return sdk;
 
+    const size_t block_end = find_object_end(content, block_start);
+    const size_t limit = (block_end == std::string::npos) ? content.size() : block_end;
+
     // Ищем записи вида "nadb.cmd": { ... }
     size_t pos = block_start + 1;
-    while (pos < content.size()) {
+    while (pos < limit) {
         // Ищем ключ
         auto q1 = content.find('"', pos);
-        if (q1 == std::string::npos) break;
+        if (q1 == std::string::npos || q1 >= limit) break;
         auto q2 = content.find('"', q1 + 1);
-        if (q2 == std::string::npos) break;
+        if (q2 == std::string::npos || q2 >= limit) break;
 
         std::string entry_key = content.substr(q1 + 1, q2 - q1 - 1);
         if (entry_key == "commands") { pos = q2 + 1; continue; }
 
         // Ищем открывающую скобку объекта
         auto obj_start = content.find('{', q2);
-        auto obj_end   = content.find('}', obj_start);
-        if (obj_start == std::string::npos || obj_end == std::string::npos) break;
+        if (obj_start == std::string::npos || obj_start >= limit) break;
+
+        auto obj_end = find_object_end(content, obj_start);
+        if (obj_end == std::string::npos || obj_end > limit) break;
 
         std::string obj = content.substr(obj_start, obj_end - obj_start + 1);
 
@@ -207,11 +285,6 @@ std::optional<DeviceSdk> SdkCache::load(const std::string& serial) const {
         }
 
         pos = obj_end + 1;
-
-        // Если следующий значимый символ это '}' — конец commands блока
-        size_t next = pos;
-        while (next < content.size() && std::isspace((unsigned char)content[next])) ++next;
-        if (next < content.size() && (content[next] == '}')) break;
     }
 
     return sdk;
@@ -222,9 +295,15 @@ bool SdkCache::is_valid(const std::string& serial,
                          const std::string& build_id) const {
     auto cached = load(serial);
     if (!cached) return false;
+
+    // Пустые метаданные с обеих сторон раньше считались совпадением,
+    // т.е. битый кэш без build_id выглядел валидным.
+    if (sdk_version.empty() || build_id.empty()) return false;
+
     return cached->sdk_version == sdk_version && cached->build_id == build_id;
 }
 
 void SdkCache::invalidate(const std::string& serial) const {
-    fs::remove(cache_path(serial));
+    std::error_code ec;
+    fs::remove(cache_path(serial), ec);
 }
