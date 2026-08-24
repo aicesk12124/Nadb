@@ -4,18 +4,23 @@
 // и богатый интерфейс к Java Framework API вместо парсинга текстового
 // вывода dumpsys/settings/svc).
 //
+// ВАЖНО про безопасность: LocalServerSocket в namespace ABSTRACT виден всем
+// процессам на устройстве, включая любое установленное приложение без
+// всяких permissions. Поэтому каждое соединение проверяется по uid пира:
+// демон общается только с shell (2000) и root (0), т.е. с тем, кто и так мог
+// бы выполнить эти действия через adb.
+//
 // Протокол: примитивный построчный текст.
 //   клиент -> "имя_команды аргумент1 аргумент2\n"
 //   демон   -> "OK <данные>\n"  или  "ERR <сообщение>\n"
 //
 // TODO:
-//   - параллельная обработка клиентов (сейчас один accept() за раз —
-//     этого достаточно для одного nadb-хоста, но не для нескольких сразу)
 //   - структурированный формат ответа (JSON) вместо простого текста,
 //     когда данных станет больше одной строки
-//   - таймаут неактивных соединений
 //   - команды, которые реально нужны нашему use-case (см. dispatch())
+//   - снятие оверлея (wm.removeView)
 
+import android.net.Credentials;
 import android.net.LocalServerSocket;
 import android.net.LocalSocket;
 
@@ -33,35 +38,114 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.lang.reflect.Method;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class NadbDaemon {
+
+    /** uid процесса shell в Android (android.os.Process.SHELL_UID). */
+    private static final int UID_SHELL = 2000;
+    /** uid процесса root. */
+    private static final int UID_ROOT = 0;
+
+    /** Сколько клиентов обслуживаем одновременно. */
+    private static final int MAX_CLIENTS = 4;
+
+    /** Закрываем молчащего клиента, чтобы не держать поток вечно. */
+    private static final int CLIENT_TIMEOUT_MS = 120000;
 
     public static void main(String[] args) throws Exception {
         String socketName = args.length > 0 ? args[0] : "nadb_daemon";
 
-        LocalServerSocket server = new LocalServerSocket(socketName);
+        LocalServerSocket server;
+        try {
+            server = new LocalServerSocket(socketName);
+        } catch (IOException e) {
+            // Раньше здесь просто летел stacktrace без объяснений.
+            System.err.println("[nadb-daemon] не удалось занять localabstract:" + socketName
+                    + " — возможно, демон уже запущен (" + e.getMessage() + ")");
+            System.exit(1);
+            return;
+        }
+
         System.out.println("[nadb-daemon] listening on localabstract:" + socketName);
 
-        // TODO: заменить на пул потоков, если понадобится несколько
-        // одновременных клиентов. Пока — последовательно, этого достаточно.
+        // Раньше клиенты обслуживались строго по очереди прямо в accept()-цикле,
+        // и один клиент, открывший сокет и ничего не пишущий, вешал весь демон
+        // на readLine() — тривиальный DoS со стороны любого приложения.
+        ThreadFactory factory = r -> {
+            Thread t = new Thread(r, "nadb-client");
+            t.setDaemon(true);
+            return t;
+        };
+        ExecutorService pool = Executors.newFixedThreadPool(MAX_CLIENTS, factory);
+
         while (true) {
-            LocalSocket client = server.accept();
-            handleClient(client);
+            final LocalSocket client;
+            try {
+                client = server.accept();
+            } catch (IOException e) {
+                System.err.println("[nadb-daemon] accept() failed: " + e);
+                continue;
+            }
+            pool.execute(() -> handleClient(client));
+        }
+    }
+
+    /**
+     * Пускаем только shell и root.
+     *
+     * Без этой проверки любое приложение на устройстве могло подключиться
+     * к localabstract:nadb_daemon и использовать его как shell-прокси, получив
+     * возможности, на которые у него нет ни одного permission.
+     */
+    private static boolean isAuthorized(LocalSocket client) {
+        try {
+            Credentials creds = client.getPeerCredentials();
+            if (creds == null) return false;
+
+            int uid = creds.getUid();
+            if (uid == UID_SHELL || uid == UID_ROOT) return true;
+
+            System.err.println("[nadb-daemon] отклонён клиент uid=" + uid + " pid=" + creds.getPid());
+            return false;
+        } catch (IOException e) {
+            // Не смогли подтвердить личность — значит не пускаем (fail-closed).
+            System.err.println("[nadb-daemon] не удалось прочитать peer credentials: " + e);
+            return false;
         }
     }
 
     private static void handleClient(LocalSocket client) {
-        try (BufferedReader in = new BufferedReader(
-                     new InputStreamReader(client.getInputStream()));
-             PrintWriter out = new PrintWriter(
-                     new OutputStreamWriter(client.getOutputStream()), true)) {
+        try {
+            if (!isAuthorized(client)) {
+                try (PrintWriter out = new PrintWriter(
+                        new OutputStreamWriter(client.getOutputStream()), true)) {
+                    out.println("ERR unauthorized");
+                }
+                return;
+            }
 
-            String line;
-            while ((line = in.readLine()) != null) {
-                out.println(dispatch(line.trim()));
+            client.setSoTimeout(CLIENT_TIMEOUT_MS);
+
+            try (BufferedReader in = new BufferedReader(
+                         new InputStreamReader(client.getInputStream()));
+                 PrintWriter out = new PrintWriter(
+                         new OutputStreamWriter(client.getOutputStream()), true)) {
+
+                String line;
+                while ((line = in.readLine()) != null) {
+                    out.println(dispatch(line.trim()));
+                }
             }
         } catch (IOException e) {
-            // клиент отключился — нормальная ситуация, просто ждём следующего accept()
+            // клиент отключился или вышел таймаут — нормальная ситуация
+        } catch (Throwable t) {
+            // Раньше ловился только IOException, и любой RuntimeException из dispatch()
+            // убивал весь демон целиком.
+            System.err.println("[nadb-daemon] ошибка при обслуживании клиента: " + t);
         } finally {
             try { client.close(); } catch (IOException ignored) {}
         }
@@ -88,7 +172,9 @@ public class NadbDaemon {
                     return "OK " + android.os.SystemClock.elapsedRealtime();
 
                 case "echo":
-                    return "OK " + cmd.substring(Math.min(cmd.length(), 5));
+                    // Было cmd.substring(Math.min(cmd.length(), 5)) — для "echoFOO"
+                    // это возвращало "FOO", хотя такой команды не существует.
+                    return "OK " + (cmd.length() > 5 ? cmd.substring(5) : "");
 
                 case "overlay":
                     return tryShowOverlay();
@@ -101,7 +187,7 @@ public class NadbDaemon {
                 default:
                     return "ERR unknown command: " + name;
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
             return "ERR exception: " + e;
         }
     }
@@ -122,11 +208,20 @@ public class NadbDaemon {
     // читается из dispatch() после короткого ожидания (см. ниже).
     private static volatile String lastOverlayResult = null;
 
+    // Looper.prepareMainLooper() можно вызвать в процессе только один раз —
+    // второй вызов "overlay" раньше гарантированно падал с IllegalStateException
+    // и плодил лишние потоки.
+    private static final AtomicBoolean overlayStarted = new AtomicBoolean(false);
+
     // TODO: убрать оверлей (wm.removeView) — сейчас только для проверки,
-    //       что вообще можно нарисовать поверх экрана; нет команды snyatia.
-    // TODO: параллельные вызовы "overlay" сейчас будут плодить потоки —
-    //       для PoC ок, для продакшена нужен guard на "уже показан".
+    //       что вообще можно нарисовать поверх экрана; нет команды снятия.
     private static String tryShowOverlay() {
+        if (!overlayStarted.compareAndSet(false, true)) {
+            return lastOverlayResult != null
+                    ? lastOverlayResult
+                    : "OK overlay already started";
+        }
+
         lastOverlayResult = null;
 
         Thread t = new Thread(() -> {
@@ -139,7 +234,9 @@ public class NadbDaemon {
                 // текущего потока. Раз наш настоящий main() (accept()-цикл)
                 // луперы вообще не создаёт, process-wide "main looper" ничей —
                 // регистрируем этот поток как главный.
-                Looper.prepareMainLooper();
+                if (Looper.getMainLooper() == null) {
+                    Looper.prepareMainLooper();
+                }
 
                 Context ctx = obtainSystemContext();
                 WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
@@ -175,6 +272,7 @@ public class NadbDaemon {
                 // permission-барьер на этом устройстве/версии не пропускает
                 // shell/system uid для TYPE_APPLICATION_OVERLAY.
                 lastOverlayResult = "ERR " + e;
+                overlayStarted.set(false); // позволяем повторить попытку
             }
         }, "nadb-overlay-thread");
         t.setDaemon(true);

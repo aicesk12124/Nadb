@@ -1,6 +1,8 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
+#include <utility>
 #include <optional>
 
 struct AdbResult {
@@ -44,18 +46,46 @@ public:
 
     const std::string& adb_path() const { return adb_path_; }
 
+    // false — adb.exe не найден ни рядом с nadb.exe, ни в PATH.
+    bool adb_binary_found() const { return !adb_path_.empty(); }
+
+    // Явно зафиксировать устройство (аналог adb -s <serial>).
+    // Нужно, когда подключено больше одного устройства.
+    void set_serial(const std::string& serial) { serial_ = serial; resolved_transport_.reset(); }
+
 private:
+    // Тип дескриптора сокета. Намеренно НЕ SOCKET и НЕ <winsock2.h>:
+    // этот заголовок подключают main.cpp / phone_info.cpp / sdk_builder.cpp,
+    // которые тянут <windows.h>, а windows.h раньше winsock2.h даёт конфликт
+    // объявлений winsock.h. На MSVC SOCKET == UINT_PTR == std::uintptr_t,
+    // поэтому определение в .cpp можно писать через привычный SOCKET —
+    // сигнатуры совпадут.
+    using socket_t = std::uintptr_t;
+
     std::string adb_path_;
+    std::string serial_;
     int server_port_ = 5037;
     mutable std::optional<bool> shell_v2_supported_;
+    mutable std::optional<std::string> resolved_transport_;
 
     // ── Fallback: старый способ через порождение процесса adb.exe ──
     AdbResult execute_process(const std::string& command) const;
 
     // ── Raw socket bridge ──
-    bool ensure_server_running() const;
+    bool ensure_server_running(std::string& err_out) const;
     AdbResult query_host(const std::string& service) const;
     AdbResult device_service(const std::string& service, bool read_until_close) const;
+
+    // Разбор вывода host:devices в пары (serial, state).
+    static std::vector<std::pair<std::string, std::string>> parse_device_list(const std::string& raw);
+
+    // Возвращает "host:transport:<serial>" для единственного онлайн-устройства
+    // либо для явно заданного serial_. transport-any больше не используется:
+    // при двух устройствах он либо падает, либо выбирает не то, что надо.
+    std::optional<std::string> resolve_transport_service(std::string& err_out) const;
+
+    // Переключает уже открытый сокет на устройство.
+    bool open_transport(socket_t s, std::string& err_out) const;
 
     // shell v2: возвращает exit_code == -2 как сигнал "handshake не удался,
     // нужно откатиться на v1" (см. shell() в .cpp)

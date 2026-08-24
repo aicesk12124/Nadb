@@ -37,8 +37,16 @@ private:
     // Постобработка вывода (убрать лишние пробелы, grep результат и т.д.)
     static std::string clean_output(const std::string& raw);
 
-    // Выполнить итоговую adb-команду (с учётом pipe/&&/;) и вернуть stdout/stderr
-    void execute_adb_command(const std::string& final_cmd, std::string& out, std::string& err) const;
+    // Выполнить итоговую adb-команду и вернуть stdout/stderr.
+    //
+    // template_cmd — исходная команда из SDK до подстановки %value%.
+    // Именно по ней решается, нужен ли raw shell: раньше решение принималось
+    // по строке с уже вставленным значением, и пользователь мог сам выбрать
+    // себе способ исполнения, просто добавив '|' или ';' в значение.
+    void execute_adb_command(const std::string& final_cmd,
+                             const std::string& template_cmd,
+                             std::string& out,
+                             std::string& err) const;
 
     // Обработка toggle.* команд: читает текущее состояние и переключает его
     ResolveResult resolve_toggle(const SdkEntry& entry, const std::string& nadb_command) const;

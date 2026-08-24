@@ -1,6 +1,7 @@
 #include "command_resolver.h"
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <vector>
 
 CommandResolver::CommandResolver(const AdbBridge& adb, const DeviceSdk& sdk)
@@ -24,6 +25,9 @@ std::string CommandResolver::clean_output(const std::string& raw) {
 }
 
 // Подставить пользовательское значение вместо плейсхолдера %value%
+//
+// ВНИМАНИЕ: эта функция сама ничего не экранирует. Вызывать её можно
+// только после успешного is_shell_safe() + validate_value().
 static std::string substitute_value(const std::string& cmd, const std::string& value) {
     static const std::string placeholder = "%value%";
     std::string out = cmd;
@@ -49,18 +53,60 @@ static std::string to_lower_copy(std::string s) {
     return s;
 }
 
+// ───────────────────────────────────────────
+// Безопасность подстановки значений
+// ───────────────────────────────────────────
+
+// Значение попадает в строку, которая исполняется shell'ом на устройстве,
+// поэтому проверяем его whitelist'ом, а не чёрным списком. Все реальные
+// значения nadb (числа, enable/disable, локали вида en-US) сюда укладываются.
+//
+// До этой проверки работало, например:
+//   nadb set.phone.locale "en-US; rm -rf /sdcard/DCIM; #"
+static bool is_shell_safe(const std::string& value, std::string& err_out) {
+    if (value.empty()) {
+        err_out = "Value must not be empty";
+        return false;
+    }
+    if (value.size() > 256) {
+        err_out = "Value is too long (max 256 characters)";
+        return false;
+    }
+    for (unsigned char c : value) {
+        const bool allowed = std::isalnum(c) || c == '.' || c == '_' || c == '-';
+        if (!allowed) {
+            err_out = "Value may contain only letters, digits, '.', '_' and '-'";
+            return false;
+        }
+    }
+    return true;
+}
+
 // Валидация значения по машиночитаемому правилу ("range:MIN:MAX" / "enum:a,b,c")
+//
+// fail-closed: раньше пустое правило, правило без двоеточия и неизвестный kind
+// возвращали true и пропускали ввод без проверки вообще. Пустое правило
+// теперь означает "только is_shell_safe", а битое/неизвестное — отказ.
 static bool validate_value(const std::string& rule, const std::string& value, std::string& err_out) {
+    // Базовая проверка действует всегда, даже когда правила нет.
+    if (!is_shell_safe(value, err_out)) return false;
+
     if (rule.empty()) return true;
 
     auto colon = rule.find(':');
-    if (colon == std::string::npos) return true; // неизвестный формат правила — пропускаем
+    if (colon == std::string::npos) {
+        err_out = "Internal error: malformed value rule \"" + rule + "\"";
+        return false;
+    }
     std::string kind = rule.substr(0, colon);
     std::string rest = rule.substr(colon + 1);
 
     if (kind == "range") {
         auto c2 = rest.find(':');
-        if (c2 == std::string::npos) return true;
+        if (c2 == std::string::npos) {
+            err_out = "Internal error: malformed range rule \"" + rule + "\"";
+            return false;
+        }
         try {
             int lo = std::stoi(rest.substr(0, c2));
             int hi = std::stoi(rest.substr(c2 + 1));
@@ -82,29 +128,39 @@ static bool validate_value(const std::string& rule, const std::string& value, st
     }
 
     if (kind == "enum") {
+        // Сравнение без учёта регистра: "ENABLE" раньше отклонялось.
+        const std::string value_lc = to_lower_copy(value);
         std::istringstream ss(rest);
         std::string opt;
         while (std::getline(ss, opt, ',')) {
-            if (opt == value) return true;
+            if (to_lower_copy(full_trim(opt)) == value_lc) return true;
         }
         err_out = "Value must be one of: " + rest;
         return false;
     }
 
-    return true;
+    err_out = "Internal error: unknown value rule kind \"" + kind + "\"";
+    return false;
 }
 
-void CommandResolver::execute_adb_command(const std::string& final_cmd, std::string& out, std::string& err) const {
+void CommandResolver::execute_adb_command(const std::string& final_cmd,
+                                          const std::string& template_cmd,
+                                          std::string& out,
+                                          std::string& err) const {
     // Для команд с pipe/&&/;  выполняем через shell целиком, а не по токенам,
-    // чтобы спецсимволы не терялись/не рвались на отдельные аргументы
-    bool needs_raw_shell = final_cmd.find('|') != std::string::npos ||
-                           final_cmd.find('&') != std::string::npos ||
-                           final_cmd.find(';') != std::string::npos;
+    // чтобы спецсимволы не терялись/не рвались на отдельные аргументы.
+    //
+    // Решение принимается строго по шаблону из SDK — доверенные данные.
+    // Раньше проверялся final_cmd, и любой '|' в пользовательском значении
+    // переключал исполнение в raw-shell режим.
+    bool needs_raw_shell = template_cmd.find('|') != std::string::npos ||
+                           template_cmd.find('&') != std::string::npos ||
+                           template_cmd.find(';') != std::string::npos;
 
     if (needs_raw_shell) {
         // Всё что после "shell " передаём целиком
         std::string shell_cmd = final_cmd;
-        if (shell_cmd.substr(0, 6) == "shell ") {
+        if (shell_cmd.compare(0, 6, "shell ") == 0) {
             shell_cmd = shell_cmd.substr(6);
         }
         auto r = adb_.shell(shell_cmd);
@@ -133,24 +189,60 @@ ResolveResult CommandResolver::resolve_toggle(const SdkEntry& entry, const std::
     }
 
     // Читаем текущее состояние через связанную get.* команду
+    const std::string& read_cmd = read_it->second.adb_command;
     std::string read_out, read_err;
-    execute_adb_command(read_it->second.adb_command, read_out, read_err);
+    execute_adb_command(read_cmd, read_cmd, read_out, read_err);
     std::string state = to_lower_copy(full_trim(read_out));
 
-    bool currently_on = (state == "1" || state == "true" || state.find("enabled") != std::string::npos);
+    // Старая эвристика считала "disabled" включённым, потому что внутри есть
+    // подстрока "enabled". Теперь точные совпадения проверяются первыми,
+    // а "disabled" явно исключается из поиска подстроки.
+    bool state_known = true;
+    bool currently_on = false;
+    if (state == "1" || state == "true" || state == "on" || state == "enabled") {
+        currently_on = true;
+    } else if (state == "0" || state == "false" || state == "off" || state == "disabled") {
+        currently_on = false;
+    } else if (state.empty() || state == "null") {
+        // Свойство не задано на этом устройстве (частый случай для
+        // global mobile_data) — раньше это тихо считалось OFF, и toggle
+        // всегда включал, а не переключал.
+        state_known = false;
+        currently_on = false;
+    } else {
+        currently_on = (state.find("enabled") != std::string::npos &&
+                        state.find("disabled") == std::string::npos);
+    }
 
     std::string new_value = currently_on ? entry.toggle_off_value : entry.toggle_on_value;
+
+    // toggle.* тоже подставляет значение в shell-строку, а раньше не проверял
+    // его вообще. Значения берутся из SDK, но SDK приезжает из кэш-файла
+    // на диске, т.е. из недоверенного источника.
+    if (entry.adb_command.find("%value%") != std::string::npos) {
+        std::string err_msg;
+        if (!is_shell_safe(new_value, err_msg)) {
+            result.error = "Internal error: unsafe toggle value in SDK (" + err_msg + ")";
+            return result;
+        }
+    }
+
     std::string final_cmd = substitute_value(entry.adb_command, new_value);
     result.adb_command = final_cmd;
 
     std::string out, err;
-    execute_adb_command(final_cmd, out, err);
+    execute_adb_command(final_cmd, entry.adb_command, out, err);
     result.error = err;
     result.executed = true;
 
-    std::string prev_label = currently_on ? "ON" : "OFF";
-    std::string new_label  = currently_on ? "OFF" : "ON";
-    result.output = nadb_command + ": " + prev_label + " -> " + new_label;
+    if (state_known) {
+        std::string prev_label = currently_on ? "ON" : "OFF";
+        std::string new_label  = currently_on ? "OFF" : "ON";
+        result.output = nadb_command + ": " + prev_label + " -> " + new_label;
+    } else {
+        result.output = nadb_command + ": current state unknown (" + entry.toggle_read_command +
+                        " returned no value on this device), assumed OFF -> ON";
+    }
     if (!out.empty()) {
         result.output += "\n" + out;
     }
@@ -197,7 +289,7 @@ ResolveResult CommandResolver::resolve(const std::string& nadb_command, const st
                                          : entry->adb_command;
     result.adb_command = final_cmd;
 
-    execute_adb_command(final_cmd, result.output, result.error);
+    execute_adb_command(final_cmd, entry->adb_command, result.output, result.error);
     result.executed = true;
     return result;
 }
